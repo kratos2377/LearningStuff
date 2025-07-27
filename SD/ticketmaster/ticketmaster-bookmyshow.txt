@@ -1,0 +1,240 @@
+Ticketmaster/Bookmyshow -> Used to book tickets for movies/events
+
+The system is actually needed to book tickets for movies/events. Multiple users can book multiple events and they should have smooth exp.
+
+
+Core Requirements:
+
+1. Users should be able to view movies/events happening based on locality. 
+2. Users should be able to reserve the ticket first (for some time like 5 mins) -> Use third party payment provider (like stripe) to pay for tickets for final confirmation
+3. Users should be able to view their tickets
+
+Mistake/Forgot 
+	Users should be able to search for events
+
+
+Non-Core Requirements:
+
+1. User view/reserving/booking ticket should have low latency and completed under <500ms
+
+Mistake/Forgot
+	1. The system should prioritize availability for searching & viewing events, but should prioritize consistency for booking events (no double booking)
+	2. The system should be scalable and able to handle high throughput in the form of popular events (10 million users, one event)
+	
+
+
+
+
+-> Core Entities
+
+
+User                 Venue                     Ticket                Booking                            Event
+	id                  id                         id                     payment_id                       event_id
+	name                coordinates                venue_id               venue_id                         venue_id
+                        name                       booked__by             ticket_ids[]                     timing
+                                                   seat_no                booking_id                       performed_by (relate to any artist/group of artists)
+                                                   booking_id             status                           coordinates
+                                                   status
+
+
+Mistake/Forgot
+	Adding Performer entity to keep them seperate from users, this will help to add more functionality
+
+
+-> APIs
+
+  GET  /events?corrdinates=[]
+
+  		Return Events[]
+
+  		1. Postgresql to keep corrdinates has geo spatial entitiy on which we can do search on basis of passed coordinates
+
+  		2. Redis to store geo hash of corrdinates and events related to that geohash -> faster query retrireval
+
+
+
+ POST /events/reserve/:eventId
+ 		Returns confirmation of reservation
+ 		Args passed -> EventId
+ 					VenueId
+ 					Seats[]
+
+ 		Returns Json with success/failure case -> Success means able to reserve seats , failure means failed to reserve all the seats.
+ 			return booking_id as well.
+
+              Way 1 (Cron job):
+              	Postgres Database -> Hold lock on the seats user wants
+              	If user is able to acquire all the locks , return success case other wise failure
+
+              	For success case, user has 5 mins to pay for tickets in order to confirm.
+
+              	TO make sure seats are freed after 5 mins if payment not complete -> Use a cron job to take list of booking created >5 mins and free those seats
+
+              	Problem: Too much compute expensive as it will require consistent searching and changing status again and again which is not good for the entire DB.
+
+
+              	Whether we use the cron job or on-demand approach, they both have significant drawbacks:
+					Cron Job Approach:
+					Delay in Unlocking: There's an inherent delay between the ticket expiration and the cron job execution, leading to inefficiencies, particularly for high-demand events. 
+					Tickets might remain unavailable for purchase even after the expiration time, reducing booking opportunities.
+					Reliability Issues: If the cron job experiences failures or delays, it can cause significant disruptions in the ticket booking process, leading to customer dissatisfaction and potential revenue loss.
+
+
+
+              Way 2 (POstgres DB TImer):
+
+              		Postgres Database -> Hold lock on the seats user wants
+              	If user is able to acquire all the locks , return success case other wise failure
+
+              	For success case, user has 5 mins to pay for tickets in order to confirm.
+
+              	TO make sure seats are freed after 5 mins if payment not complete, 
+              	Add a Transcation in DB to be activated after 5 mins and free the seats. Since postgres is a SQL database we can use these transactions that are available
+
+              	Problem: DB is a single Point of failure + we are putting too much stress on DB using too many transactions
+
+             Way 3 (Use Redis Locks with TTL):
+
+             		Redis Locks provide us with something call sorted sets which will help us keeping distributed locks on the seats and with TTL we can make sure the lock is expired on its own after the TTL
+
+
+
+
+            The way API is going to work:
+
+            	User sends args -> We check if Redis Lock can be acquired on all seats
+
+            	If No -> Fail request
+
+            	If yes -> Lock those seats with TTL = (Date.now() + 300)
+
+
+
+
+              	Note: While anything from MySQL to DynamoDB would be fine choices (just needs ACID properties), we'll opt for PostgreSQL. Additionally, we need to implement proper isolation levels and either row-level locking or Optimistic Concurrency Control (OCC) to fully prevent double bookings.
+
+ 
+
+ POST /events/payment/:eventId/:bookingId
+
+ 		Initialize Stripe Payment Page to  pay for the booking
+ 			-> If booking successful we will get success event in form of direct JSON response or webhook and we can change the status of the booking and send the confirm tickets to user
+
+ 			returns {
+
+ 				booking: Booking,
+ 				tickets: Tickets[]
+
+ 			}   
+
+
+ 			Note: When a user goes to book a ticket, the following happens:
+				1. The user is redirected to a booking page where they can provide their payment details and confirm the booking.
+				2. Upon confirmation, a POST request is sent to the /bookings endpoint with the selected ticket IDs.
+							The booking server initiates a transaction to:
+							Check the availability of the selected tickets.
+							Update the status of the selected tickets to "booked".
+							Create a new booking record in the Bookings table.
+				3. If the transaction is successful, the booking server returns a success response to the client. Otherwise, if the transaction failed because another user booked the ticket in the meantime, the server returns a failure response and we pass this information back to the client.        	
+
+
+
+
+GET /booking/:bookingId
+	
+	Returns Booking Entity
+
+
+
+Mistake/Forgot
+ 1.  for search, we just need a single GET endpoint that takes in a set of search parameters and returns a list of events that match those parameters.
+ 	GET /events/search?keyword={keyword}&start={start_date}&end={end_date}&pageSize={page_size}&page={page_number} -> Event[]
+
+
+
+
+Mistake/Forgot:
+-> Potential Deep Dive:
+	
+	Q1. How will the system ensure a good user experience during high-demand events with millions simultaneously booking tickets?
+
+
+	Good Solution:
+		To ensure that the seat map is always up to date, we can use Server-Sent Events (SSE) to push updates to the client in real-time. This will allow us to update the seat map as soon as a seat is booked (or reserved) by another user without needing to refresh the page. SSE is a unidirectional communication channel between the server and the client. It allows the server to push data to the client without the client having to request it.
+		Challenges
+		While this approach works well for moderately popular events, the user experience will still suffer during extremely popular events. In the "Taylor Swift case," for example, the seat map will immediately fill up, and users will be left with a disorienting and overwhelming experience as available seats disappear in an instant.
+
+
+	Great Solution:
+		For extremely popular events, we can implement an admin enabled virtual waiting queue system to manage user access during times of exceptionally high demand. Users are placed in this queue before even being able to see the booking page (seat map selected). 
+		It is designed to control the flow of users accessing the booking interface, thereby preventing system overload and enhancing the user experience. Here is how it would work at a high level:
+		1. When a user requests to view the booking page, they are placed in a virtual queue. We establish a WebSocket connection with their client and add the user to the queue using their unique WebSocket connection.
+		2. Periodically or based on certain criteria (like tickets booked), dequeue users from the front of the queue. Notify these users via their WebSocket connection that they can proceed to purchase tickets.
+		3. At the same time, update the database to reflect that this user is now allowed to access the ticket purchasing system.
+
+		Challenges
+		Long wait times in the queue might lead to user frustration, especially if the estimated wait times are not accurate or if the queue moves slower than expected. By pushing updates to the client in real-time, we can mitigate this risk by providing users with constant feedback on their queue position and estimated wait time.
+
+
+
+
+
+	Q2. How can you improve search to ensure we meet our low latency requirements?
+
+		Our current search implementation is not going to cut it. Queries to search for events based on keywords in the name, description, or other fields will require a full table scan because of the wildcard in the LIKE clause. This can be very slow, especially as the number of events grows.
+		-- slow query
+		SELECT * 
+		FROM Events
+		WHERE name LIKE '%Taylor%' 
+		  OR description LIKE '%Taylor%'
+		Let's look at some strategies to improve search performance and ensure we meet our low latency requirements.
+
+
+
+		Good Solution:
+			1. Create indexes on the Event, Performer, and Venues tables to improve query performance. Indexes allow for faster data retrieval by mapping the values in specific columns to their corresponding rows in the table. 
+			This speeds up search queries by reducing the number of rows that need to be scanned. We want to index the columns that are frequently used in search queries, such as event name, event date, performer name, and venue location.
+
+			2. Optimize queries to improve performance. This includes techniques like using EXPLAIN to analyze query execution plans, avoiding SELECT * queries, and using LIMIT to restrict the number of rows returned. 
+			Additionally, using UNION instead of OR for combining multiple queries can improve performance.
+
+			Challenges
+			Standard indexes are less effective for queries involving partial string matches (e.g., searching for "Taylor" instead of the full "Taylor Swift"). This requires additional considerations, like implementing full-text search capabilities or using LIKE operators, which can be less efficient.
+			While indexes improve query performance, they can also increase storage requirements and slow down write operations, as each insert or update may necessitate an index update.
+			Finding the right balance between the number of indexes and overall database performance, especially considering the diverse and complex query patterns in a ticketing system.
+
+
+		Great Solution: 
+
+			We can extend the basic indexing strategy above to utilize full-text indexes in our database, if available. For popular SQL databases like MySQL or Postgres, full text extensions are available which utilize search engines like Lucene under the covers. These make queries for specific strings like "Taylor" or "Swift" much faster than doing a full table scan using LIKE.
+
+			Challenges
+			Full text indexes require additional storage space and can be slower to query than standard indexes.
+			Full text indexes can be more difficult to maintain, as they require special handling in both queries and in maintaining the database.
+
+
+
+		Great Solution (2nd way):
+
+			Add Elasticsearch or a similar full-text search engine. Elasticsearch is a powerful search engine that excels in full-text search, complex query execution, and handling high-volume traffic efficiently. 
+			At its core, Elasticsearch operates using inverted indexes, a key feature that makes it highly efficient for search operations. Inverted indexes allow Elasticsearch to quickly locate and retrieve data by mapping each unique word to the documents or records it appears in, significantly speeding up search queries.
+
+			1. To make sure the data in Elasticsearch is always in sync with the data in our SQL DB, we can use change data capture (CDC) for real-time or near-real-time data synchronization from PostgreSQL to Elasticsearch. This setup captures changes in the PostgreSQL database, such as inserts, updates, and deletes, and replicates them to the Elasticsearch index.
+			2. We can enable fuzzy search functionality with Elasticsearch, which allows for error tolerance in search queries. This is way we can handle typos and slight variations in spellings such as "Taylor Swift" vs "Tayler Swift". This is something that would be very difficult to do with SQL alone.
+
+			Challenges
+			1. Keeping the Elasticsearch index synchronized with PostgreSQL can be complex and requires a reliable mechanism to ensure data consistency.
+			2. Maintaining an Elasticsearch cluster adds additional infrastructure complexity and cost.
+
+
+More Points for Improvement:
+	Dont just write Text, make better diagrams on excalidraw
+
+
+
+
+
+
+
+Reference Point to read:
+https://www.hellointerview.com/learn/system-design/problem-breakdowns/ticketmaster
