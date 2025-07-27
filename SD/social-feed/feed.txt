@@ -1,0 +1,182 @@
+Twitter/FB/Insta Feed 
+
+Feed for user home page which represents Posts according to user interests/following
+
+
+Core Requirements:
+	
+	1.Users should be able to create posts.
+	2. Users should be able to friend/follow people.
+	3. Users should be able to view a feed of posts from people they follow, in chronological order.
+	4. Users should be able to page through their feed.
+
+Non-Core Requirements:
+	
+	1. Time to fetch feed should be < 500 ms
+	2. Since each user is trying fetch their feed its going to be Read heavy system
+	3. Users feed should be updated with new changes as fast as possible
+	4. System is going to have high write throughput
+
+
+	Mistakes/Forgot:
+		1. The system should be highly available (prioritizing availability over consistency). We'll tolerate up to 1 minute of post staleness (eventual consistency).
+		2. Users should be able to follow an unlimited number of users, users should be able to be followed by an unlimited number of users.
+
+
+
+
+Core Entities:
+
+User           UserFollowing                   Post
+ id                     id                       id
+ name                   followingId              user_id
+ username               followerId               content
+                                                 media_urls
+
+
+
+
+ APIs:
+
+ POST /posts/create
+ 		Args -> UserId, content, media_urls
+ 		return 200 -> Post_id
+ 				4xx
+ 				5xx
+
+ 		We can use something like DynamoDB which also provides ACID compliance to save our Posts
+ 		Additionally We can use something like S3 to store all the media required and then save all the media URLs
+
+ 		When user tries to save a post -> we request a presigned S3 url from our post service and then we will get our media urls which we can save 
+ 		in our DB.
+
+ 		Once the post is create we can captured the CDC (change data capture and aggregate on basis of user_id)
+ 		We capture CDC using a kafka service and these events are read by a Post CDC consumer service which updates the feed table by fetching followers of the user_id
+ 		This is needed so that we can update Feed Table for all the users following the user who created the post.
+
+
+
+
+
+POST   /friends/create
+DELETE   ARGS -> {user_id , user_who_you_want_to_follow_id}
+
+			Update the DB accordingly either by creating a new record or deleting one.
+
+
+		Mistake/Forgot:
+			Note :
+
+			Functionally, following or friending a person is establishing a relationship between two users. This is a many-to-many relationship, and we can model it as a graph. Typically, for a graph you'll use a purpose-built graph database (like Neo4j) or a triple store. However, for our purposes, we can use a simple key-value store and model the graph ourselves
+
+
+			Graph databases can be more useful when you need to do traversals or comprehensions of a graph. This usually requires stepping between different nodes, like capturing the friends of your friends or creating an embedding for a recommendation system. We only have simple requirements in this problem so we'll keep our system simple and save ourselves from scarier questions like "how do you scale Neo4j?" We don't need a full-fledged graph database for this problem.
+
+
+			To do this, we'll have a simple Follow table using the entire relation with userFollowing as the partition key and userFollowed as the sort key. We can also create a Global Secondary Index (GSI) with the reverse relationship (e.g. partition key of userFollowed and sort key of userFollowing) to allow us to look up all the followers of a given user.
+			This allows us to query for the important pieces:
+			1. If we want to check if the user is following another user, we query with both the partition key and the sort key (e.g. userFollowing:userFollowed). This is a simple lookup!
+			2. If we want to get all the users a given user is following, we query with the partition key (e.g. userFollowing). This is a range query.
+			3. If we want to get all the users who are following a given user, we query the GSI with its partition key (e.g. userFollowed). This is a range query.
+
+
+
+GET /feed/:userId
+
+	Returns top 20 Posts for that User
+
+
+	Mistake/Forgot:
+
+	This is better GET call for feed since it considers pagination arg as query parameter
+	// GET /feed?pageSize={size}&cursor={timestamp?}
+		{
+		    items: Post[],
+		    nextCursor: string
+		}
+
+
+
+
+Potential Dives:
+
+Q1 How do we handle users who are following a large number of users?
+	For users following a large number of users we can keep a PrecomputedFeed table. Instead of querying the Follow and Post tables, we'll be able to pull from this precomputed table. Then, when a new post is created, we'll simply add to the relevant feeds.
+	The PrecomputedFeed table itself is just a list of post IDs, stored in chronological order, and limited to a small number of posts (say 200 or so). We want this table to be compact so we can minimize the amount of space we require. We'll use a partition key of the userId of the feed and its value will be a list of post IDs in order. Since we only ever access this table by user ID, we don't need to deal with any secondary indexes.
+
+
+Q2 How do we handle users with a large number of followers?
+
+	When a user has a large number of followers we have a similar fanout problem when we create a post: we need to write to millions of Feed records!
+	Because we chose to allow some inconsistency in our non-functional requirements, we have a short window of time (< 1 minute) to perform these writes.
+
+
+	Bad Solution:
+		The naive approach is simply to blast out all the requests at once from our Post Service when the post is created. This will fail.
+		In the worst case, we're trying to write to millions of feeds with the new Post entry.
+
+		Challenges
+		This approach is basically unworkable both due to limitations in the number of connections that can be made from our single Post Service host as well as the latency available. In the best case that it does function, the load on our Post Service becomes incredibly uneven: one Post Service host might be writing to millions of feeds while another is basically idle. This makes the system difficult to scale.
+
+
+
+	Good Solution (Aync Workers) :
+
+	A better option would be to make use of async workers behind a queue. Since our system tolerates some delay between when the post is written and when the post needs to be available in feeds, we can queue up write requests and have a fleet of workers consume these requests and update feeds.
+	Any queue will work here so long as it support at-least-once delivery of messages and is highly scalable. Amazon's Simple Queue Service (SQS) will work great here.
+	When a new post is created we create an entry in the SQS queue with the post ID and the creator user ID. Each worker will look up all the followers for that creator and prepend the post to the front of their feed entry.
+
+
+	Challenges:
+	The throughput of the feed workers will need to be enormous. For small accounts with limited followers, this isn't much of a problem: we'll only be writing to a few hundred feeds. For mega accounts with millions of followers, the feed workers have a lot of work to do. We consider this in our Great solution.
+	Also, we need to be aware of the variable amount of work for each entry in the queue. One item which is to push posts for a user with 1M followers is dramatically more work than the one which is only to push to 1k followers. We may need to break up these tasks
+
+
+
+
+	Great Solution (Async Workers with hybrid feed):
+
+	A great option would extend on Async Workers outlined above. We'll create async feed workers that are working off a shared queue to write to our precomputed feeds.
+
+		But we can be more clever here: we can choose which accounts we'd like to pre-calculate into feeds and which we do not.
+	For Justin Bieber (and other high-follow accounts), instead of writing to 90+ million followers we can instead add a flag onto the Follow table which indicates that this particular follow isn't precomputed. In the async worker queue, we'll ignore requests for these users.
+	On the read side, when users request their feed via the Feed Service, we can grab their (partially) precomputed feed from the Feed Table and merge it with recent posts from those accounts which aren't precomputed.
+	This hybrid approach allows us to choose whether we fanout on read or write and for most users we'll do a little of both. This is a great system design principle! In most situations we don't need a one-size-fits-all solution, we can instead come up with clever ways to solve for different types of problems and combine them together.
+
+	Challenges
+	Doing the merging of feeds at read time vs at write time means more computation needs to be done in the Feed Service. We can tune the threshold over which an account is ignored in precomputation.
+
+
+
+
+
+
+
+Q3 How can we handle uneven reads of Posts?
+
+	To this point, our feed service has been reading directly from the Post table whenever a user requests to get their feed. For the vast majority of posts, they will be read for a few days and never read again. For some posts (especially those from accounts with lots of followers), the number of reads the post experiences in the first few hours will be massive.
+
+	DynamoDB, like many key value stores, offers nearly infinite scaling provided certain conditions are met. One of the more important conditions is there being even load across the keyspace. Under the covers DynamoDB has physical machines with real limitations like any other database. If Post1 gets 500 requests per second and Post2 through Post 1000 get 0 requests per second, this is not even load!
+	Fortunately for us, Posts are far more likely to be created than they are to be edited. But how do we solve the issue of hot keys in our Post Table?
+
+
+	Good Solution (Post Cache with large keyspace):
+
+	A good solution for this problem is to insert a distributed cache between the readers of the Post table and the table itself. Since posts are very rarely edited, we can keep a long time to live (TTL) on the posts and have our cache evict posts that are least recently used (LRU). As long as our cache is big enough to house most recent posts, the vast majority of requests to the Post Table will instead hit our cache. If we have N hosts with M memory, our cache can fit as many posts as fit in N*M.
+	When posts are edited (not created!) we simply invalidate the cache for that post ID.
+
+
+	Challenges
+	
+	The biggest challenge with the Post Cache is it has the same hot key problem that the Post Table did! For the unlucky shard/partition that has multiple viral posts, the hosts that support it will be getting an unequal distribution of load (again) which makes this cache very hard to scale. Many of the hosts will be underutilized.
+
+
+	Great Solution (Redundant Post cache):
+
+	Like the Distributed Post Cache above, a great solution for this problem is to insert a cache between the readers of the Post table and the table itself. Since posts are very rarely edited, we can keep a long time to live (TTL) on the posts and have our cache evict posts that are least recently used (LRU). As long as our cache is big enough to house our most popular posts, the vast majority of requests to the Post Table will instead hit our cache.
+	Unlike the Distributed Post Cache solution above, we can choose to have multiple distinct caches that our readers can hit. These cache instances don't need to coordinate. Instead of distributing the posts in our cache across the entire fleet, we can have multiple instances which can all service the same postID. This does mean we may have more requests that end up going to our database (for a very viral post, with N cache instances, we might have N requests to the database instead of 1 if we had sharded the cache by postID). But N requests is much, much smaller than the millions of requests we'd need to handle if we didn't have a cache in the first place.
+	Both solve the problem, but this solution means we have N times the throughput for a hot key without any additional coordination required.
+
+
+	Challenges
+	In this case, we will have a smaller number of posts across our cache than if we chose to distribute or partition the posts. This is probably ok since our DynamoDB backing store can handle some variability in read throughput and is still fast.
