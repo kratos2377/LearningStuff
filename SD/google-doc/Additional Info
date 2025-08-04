@@ -1,0 +1,87 @@
+Google Doc
+
+Complete Actual Solution: https://systemdesignschool.io/problems/google-doc/solution
+
+Notes to self
+ Think more of Scale Requirements:
+ 	DAU: 1 million.
+	Traffic Spike: 5x during peak hours
+	Read to write ratio: 10:1
+	Average Document Size: 100KB. Assume each user has an average of 10 documents.
+	Edit Frequency: 1 edit per second per document during peak hours
+	Allow up to 100 concurrent users per document
+
+
+ More Non-Core Requirements:
+ 	High availability: The system must be accessible at all times, minimizing downtime to ensure continuous collaboration.
+	Low latency: End-to-end latency should be under 200 milliseconds.
+	Eventual Consistency: All users should eventually see the same document state, even if edits arrive at different times.
+	Read-Your-Writes Consistency: Users should see their own edits immediately to confirm their changes have been registered.
+
+
+
+Synchronizing Document State
+
+Websocket is the best option for our system because it supports bidirectional communication and is suitable for real-time collaborative editing.
+
+We want to add a Websocket Service in front of Document Service to support bidirectional communication. We could include the websocket service in Document Service, but it would be better to have a separate service because to separate the concerns of document storage and document synchronization and to make the Document Service stateless.
+
+Additionally, we want to add a Message Queue between Document Service and Websocket Service to decouple them and to improve the availability and reliability of the Document Service. This is the classic system design template for large scale system design we have been using throughout our courses.
+
+
+Handling conflicts
+
+1. Last-Write-Wins
+First, let's keep it simple and use the Last-Write-Wins strategy. In this approach, each edit is timestamped, and when conflicts occur, the edit with the latest timestamp is chosen as the winner.
+
+Here's an example:
+
+Initial document state: "Hello World"
+User A starts editing at position 6 at timestamp 100
+User B starts editing at position 6 at timestamp 101
+User A sends edit: insert " beautiful" → "Hello beautiful World"
+User B sends edit: insert " amazing" → "Hello amazing World"
+Since User B's edit has a later timestamp (101 > 100), the final state becomes "Hello amazing World"
+Pros:
+
+Simple to implement
+Works well for basic collaborative scenarios
+Low overhead in terms of storage and computation
+Cons:
+
+Can lead to lost updates
+Not suitable for fine-grained collaboration where multiple users edit the same region
+May result in unexpected behavior from the user's perspective
+This approach is suitable for simple collaborative scenarios where conflicts are rare and losing occasional edits is acceptable. However, for a professional collaborative editing system like Google Docs, we need a more sophisticated approach like Operational Transformation, which we'll discuss next.
+
+2. Operational Transformation
+The primary goal of Operational Transformation (OT) is to ensure that all users see the same final document state after a series of edits, even if those edits are made out of order. It does this by applying transformation functions to modify the conflicting operation so that they can be applied in a way that preserves the intention of each user's changes.
+
+Let's use the same example as above to illustrate how OT works. At step 6, instead of choosing the latest edit, the OT will transform the edit
+
+Since A's edit comes first, it will be applied first.
+After applying this operation, the document becomes "Hello beautiful World"
+OT will then transform User B's Operation Based on User A's Edit
+
+User B wanted to insert " amazing" at position 6 in the original document. However, User A's insertion of " beautiful" has shifted the text "World" to the right.
+New Position for User B's Edit: After User A's insertion of " beautiful," position 6 becomes position 16 (because " beautiful" is 10 characters long).
+Transformed User B's Operation: Insert " amazing" at position 16 in the updated document.
+Now we can apply User B's transformed operation to the document.
+
+The document state becomes "Hello beautiful amazing World" and this is the final state.
+This is a simple example. In a real-world collaborative editing system, the operations can be much more complex.
+
+Pros:
+
+Preserves the intention of each user's changes
+Suitable for fine-grained collaboration
+Cons:
+
+More complex to implement
+OT may have scalability limitations, especially when many users are making edits simultaneously. The transformation functions can become computationally expensive as the number of operations and conflicts increases, potentially leading to performance bottlenecks.
+This is one of the reason why collaborative editing systems typically allow only a small number of concurrent users to edit the same document.
+
+
+3. CRDTS (Conflict Free Data Types)
+	Read This: https://medium.com/@raphlinus/towards-a-unified-theory-of-operational-transformation-and-crdt-70485876f72f
+	Also This: https://shambhavishandilya.medium.com/understanding-real-time-collaboration-with-crdts-e764eb65024e
