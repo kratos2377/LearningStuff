@@ -6,3 +6,7 @@ The system should automatically update the current highest bid and notify the bi
 The auction should end when the specified duration is reached, and the highest bidder should be declared the winner.
 The system should handle concurrent access to auction listings and ensure data consistency.
 The system should be extensible to accommodate future enhancements and new features.
+
+
+# Entities
+User,Auction,Item,Bid
